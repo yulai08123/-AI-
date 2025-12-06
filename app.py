@@ -1,107 +1,124 @@
-import os
-import urllib.request
-import subprocess
-import time
-
-# ================= 1. 安裝環境 =================
-print("📦 正在檢查與安裝必要套件...")
-os.system("pip install -q streamlit google-generativeai google-api-python-client requests")
-
-# 下載更穩定的連線工具 (Cloudflare)
-if not os.path.exists("cloudflared"):
-    print("⬇️ 正在下載 Cloudflare 通道工具 (比 localtunnel 更穩)...")
-    os.system("wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared")
-
-# ================= 2. 寫入軟體程式碼 (app.py) =================
-app_code = """
 import streamlit as st
 import google.generativeai as genai
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta
+import re
 
-st.set_page_config(page_title="AI 爆款短影音複製機 (公開版)", page_icon="🎬", layout="wide")
+# 設定網頁
+st.set_page_config(page_title="AI 爆款短影音複製機 (秒數精準版)", page_icon="⏱️", layout="wide")
 
-# 側邊欄：使用者 Key
+# ================= 側邊欄：API Key =================
 with st.sidebar:
     st.header("🔑 啟動設定 (Bring Your Own Key)")
-    st.info("請輸入 API Key 以啟動工具 (不會儲存)")
+    st.info("請輸入 API Key 以啟動工具")
+    
     youtube_key = st.text_input("1. YouTube API Key", type="password")
     gemini_key = st.text_input("2. Gemini API Key", type="password")
     kling_token = st.text_input("3. Kling Token", type="password")
+    
     st.divider()
+    st.caption("Updated for Jiang Mo | Precision Duration Filter")
 
+# ================= 檢查鑰匙 =================
 def check_keys():
     if not youtube_key or not gemini_key:
         st.warning("⚠️ 請先在左側側邊欄填入 API Key！")
         st.stop()
 
-def search_youtube(api_key, query, days, min_views):
+# ================= 輔助功能：解析 YouTube 時間格式 (PT1M15S -> 75秒) =================
+def parse_duration(duration_iso):
+    """將 ISO 8601 格式 (如 PT1M5S) 轉為秒數 (65)"""
+    try:
+        # 使用正規表達式抓取 分(M) 和 秒(S)
+        match = re.match(r'PT((\d+)M)?((\d+)S)?', duration_iso)
+        if not match: return 0
+        
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(4) or 0)
+        return minutes * 60 + seconds
+    except:
+        return 0
+
+# ================= 核心搜尋邏輯 =================
+def search_youtube(api_key, query, days, min_views, max_seconds):
     try:
         youtube = build('youtube', 'v3', developerKey=api_key)
         pub_after = (datetime.now() - timedelta(days=days)).isoformat("T") + "Z"
-        res = youtube.search().list(q=query, part='id,snippet', maxResults=20, order='viewCount', publishedAfter=pub_after, type='video', videoDuration='short').execute()
+        
+        # 1. 初步搜尋 (先抓 50 筆短片，因為過濾秒數後會變少)
+        res = youtube.search().list(
+            q=query, part='id,snippet', maxResults=50, 
+            order='viewCount', publishedAfter=pub_after, 
+            type='video', videoDuration='short' # 這裡只能過濾 < 4分鐘
+        ).execute()
+        
         v_ids = [i['id']['videoId'] for i in res['items']]
         if not v_ids: return []
-        stats = youtube.videos().list(part='statistics,snippet', id=','.join(v_ids)).execute()
+        
+        # 2. 抓取詳細資料 (包含 duration 和 viewCount)
+        stats = youtube.videos().list(
+            part='statistics,snippet,contentDetails', # 多抓了 contentDetails
+            id=','.join(v_ids)
+        ).execute()
+        
         final = []
         for i in stats['items']:
-            views = int(i['statistics'].get('viewCount',0))
-            if views >= min_views:
-                final.append({'title': i['snippet']['title'], 'img': i['snippet']['thumbnails']['high']['url'], 'views': views, 'id': i['id'], 'url': f"https://www.youtube.com/watch?v={i['id']}"})
+            # 取得觀看數
+            views = int(i['statistics'].get('viewCount', 0))
+            # 取得並計算秒數
+            duration_str = i['contentDetails']['duration']
+            seconds = parse_duration(duration_str)
+            
+            # ⭐️ 這裡進行雙重過濾：觀看數夠高 AND 秒數夠短
+            if views >= min_views and 0 < seconds <= max_seconds:
+                final.append({
+                    'title': i['snippet']['title'], 
+                    'img': i['snippet']['thumbnails']['high']['url'], 
+                    'views': views, 
+                    'duration': seconds, # 存起來顯示用
+                    'id': i['id'],
+                    'url': f"https://www.youtube.com/watch?v={i['id']}"
+                })
+                
+        # 依照觀看數排序
         return sorted(final, key=lambda x: x['views'], reverse=True)
     except Exception as e:
         st.error(f"YouTube 搜尋失敗: {e}")
         return []
 
-def make_prompt(gemini_key, title):
+def make_prompt(gemini_key, title, duration):
     try:
         genai.configure(api_key=gemini_key)
-        prompt = f"你是短影音導演。請分析標題「{title}」，寫一段英文 Prompt 適合 Kling AI 生成 5 秒短片 (含運鏡、光影、主體)。"
-        return genai.GenerativeModel('gemini-1.5-flash').generate_content(prompt).text
-    except: return "Gemini 分析失敗"
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        # 提示詞中加入秒數限制
+        prompt = f"你是一位短影音導演。請分析爆款標題：「{title}」。請構思一個 {duration} 秒左右的短影片。請直接給我一段【英文 Prompt】給 Kling AI 生成，包含：主體描述、環境光影、運鏡方式。不要有其他廢話。"
+        return model.generate_content(prompt).text
+    except Exception as e:
+        return f"Gemini 分析失敗: {e}"
 
-st.title("🚀 AI 爆款短影音複製機")
+# ================= 主畫面 (UI) =================
+st.title("⏱️ AI 爆款複製機 (精準秒數版)")
 check_keys()
 
-col1, col2 = st.columns([3, 1])
+col1, col2, col3 = st.columns([2, 1, 1])
 with col1:
     q = st.text_input("輸入關鍵字", "貓咪 療癒")
-    days = st.slider("幾天內?", 1, 90, 7)
+    days = st.slider("幾天內的爆款?", 1, 90, 7)
 with col2:
-    v = st.number_input("觀看數門檻", 10000)
+    # ⭐️ 新增的秒數拉桿
+    max_sec = st.slider("影片長度上限 (秒)", 5, 60, 15, help="只會搜尋比這個時間短的影片")
+with col3:
+    v = st.number_input("最低觀看數", 10000)
     
 if st.button("🔍 搜尋爆款", type="primary"):
-    with st.spinner("挖掘數據中..."):
-        res = search_youtube(youtube_key, q, days, v)
+    with st.spinner(f"正在挖掘 {max_sec} 秒以內的爆款..."):
+        res = search_youtube(youtube_key, q, days, v, max_sec)
         if res:
+            st.success(f"找到 {len(res)} 支符合條件的影片！")
             st.session_state['results'] = res
         else:
-            st.warning("無結果或 Key 錯誤")
+            st.warning("找不到影片，請嘗試放寬秒數或觀看數條件。")
 
 if 'results' in st.session_state:
     st.divider()
-    for item in st.session_state['results']:
-        with st.container(border=True):
-            c1, c2 = st.columns([1,3])
-            c1.image(item['img'])
-            c2.subheader(item['title'])
-            c2.caption(f"👀 {item['views']:,} | [連結]({item['url']})")
-            if c2.button("✨ 生成 Prompt", key=item['id']):
-                with st.spinner("分析中..."):
-                    c2.text_area("Prompt:", make_prompt(gemini_key, item['title']))
-"""
-
-with open("app.py", "w", encoding="utf-8") as f:
-    f.write(app_code)
-
-print("✅ 軟體已準備就緒！")
-
-# ================= 3. 啟動 Web App =================
-print("🚀 正在啟動伺服器... (請等待下方出現 trycloudflare 網址)")
-
-# 背景執行 Streamlit
-subprocess.Popen(["streamlit", "run", "app.py"])
-
-# 使用 Cloudflare 建立通道 (不需密碼)
-time.sleep(3) # 等待 Streamlit 啟動
-os.system("./cloudflared tunnel --url http://localhost:8501")
+    for item in st.session_state['results
