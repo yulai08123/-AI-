@@ -45,11 +45,11 @@ def search_youtube(api_key, query, days, min_views, max_seconds):
         youtube = build('youtube', 'v3', developerKey=api_key)
         pub_after = (datetime.now() - timedelta(days=days)).isoformat("T") + "Z"
         
-        # 1. 初步搜尋 (先抓 50 筆短片，因為過濾秒數後會變少)
+        # 1. 初步搜尋 (先抓 50 筆短片)
         res = youtube.search().list(
             q=query, part='id,snippet', maxResults=50, 
             order='viewCount', publishedAfter=pub_after, 
-            type='video', videoDuration='short' # 這裡只能過濾 < 4分鐘
+            type='video', videoDuration='short'
         ).execute()
         
         v_ids = [i['id']['videoId'] for i in res['items']]
@@ -57,7 +57,7 @@ def search_youtube(api_key, query, days, min_views, max_seconds):
         
         # 2. 抓取詳細資料 (包含 duration 和 viewCount)
         stats = youtube.videos().list(
-            part='statistics,snippet,contentDetails', # 多抓了 contentDetails
+            part='statistics,snippet,contentDetails', 
             id=','.join(v_ids)
         ).execute()
         
@@ -75,7 +75,7 @@ def search_youtube(api_key, query, days, min_views, max_seconds):
                     'title': i['snippet']['title'], 
                     'img': i['snippet']['thumbnails']['high']['url'], 
                     'views': views, 
-                    'duration': seconds, # 存起來顯示用
+                    'duration': seconds, 
                     'id': i['id'],
                     'url': f"https://www.youtube.com/watch?v={i['id']}"
                 })
@@ -90,7 +90,6 @@ def make_prompt(gemini_key, title, duration):
     try:
         genai.configure(api_key=gemini_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
-        # 提示詞中加入秒數限制
         prompt = f"你是一位短影音導演。請分析爆款標題：「{title}」。請構思一個 {duration} 秒左右的短影片。請直接給我一段【英文 Prompt】給 Kling AI 生成，包含：主體描述、環境光影、運鏡方式。不要有其他廢話。"
         return model.generate_content(prompt).text
     except Exception as e:
@@ -105,7 +104,7 @@ with col1:
     q = st.text_input("輸入關鍵字", "貓咪 療癒")
     days = st.slider("幾天內的爆款?", 1, 90, 7)
 with col2:
-    # ⭐️ 新增的秒數拉桿
+    # 秒數拉桿
     max_sec = st.slider("影片長度上限 (秒)", 5, 60, 15, help="只會搜尋比這個時間短的影片")
 with col3:
     v = st.number_input("最低觀看數", 10000)
@@ -121,4 +120,14 @@ if st.button("🔍 搜尋爆款", type="primary"):
 
 if 'results' in st.session_state:
     st.divider()
-    for item in st.session_state['results
+    for item in st.session_state['results']:  # <-- 這裡是你剛剛報錯的地方，現在修好了
+        with st.container(border=True):
+            c1, c2 = st.columns([1,3])
+            c1.image(item['img'])
+            c2.subheader(item['title'])
+            c2.caption(f"⏱️ 長度: {item['duration']}秒 | 👀 觀看: {item['views']:,} | [原片連結]({item['url']})")
+            
+            if c2.button("✨ 生成 Kling 提示詞", key=item['id']):
+                with st.spinner("Gemini 正在分析..."):
+                    prompt = make_prompt(gemini_key, item['title'], item['duration'])
+                    c2.text_area("複製 Prompt:", prompt, height=100)
